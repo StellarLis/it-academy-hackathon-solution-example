@@ -34,7 +34,7 @@ REQUIRED_ENV_VARS = [
     "RERANKER_URL",
     "QDRANT_URL",
 ]
- 
+
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 logger = logging.getLogger("search-service")
 
@@ -44,10 +44,14 @@ def validate_required_env() -> None:
         raise RuntimeError("OPEN_API_LOGIN and OPEN_API_PASSWORD must be set together")
 
     if not API_KEY and not (OPEN_API_LOGIN and OPEN_API_PASSWORD):
-        raise RuntimeError("Either API_KEY or OPEN_API_LOGIN and OPEN_API_PASSWORD must be set")
+        raise RuntimeError(
+            "Either API_KEY or OPEN_API_LOGIN and OPEN_API_PASSWORD must be set"
+        )
 
     missing_env_vars = [
-        name for name in REQUIRED_ENV_VARS if os.getenv(name) is None or os.getenv(name) == ""
+        name
+        for name in REQUIRED_ENV_VARS
+        if os.getenv(name) is None or os.getenv(name) == ""
     ]
     if not missing_env_vars:
         return
@@ -129,10 +133,11 @@ class SparseVector(BaseModel):
 class SparseEmbeddingResponse(BaseModel):
     vectors: list[SparseVector]
 
+
 # Метадата чанков в Qdrant'e, по которой вы можете фильтровать
 class ChunkMetadata(BaseModel):
     chat_name: str
-    chat_type: str # channel, group, private, thread
+    chat_type: str  # channel, group, private, thread
     chat_id: str
     chat_sn: str
     thread_sn: str | None = None
@@ -175,6 +180,7 @@ DENSE_PREFETCH_K = 10
 SPRASE_PREFETCH_K = 30
 RETRIEVE_K = 20
 RERANK_LIMIT = 10
+
 
 async def embed_dense(client: httpx.AsyncClient, text: str) -> list[float]:
     # Dense endpoint ожидает OpenAI-compatible body с input как списком строк.
@@ -320,13 +326,11 @@ async def search(payload: SearchAPIRequest) -> SearchAPIResponse:
 
     best_points = await rerank_points(client, query, list(best_points))
 
-    message_ids: list[str] = [] 
+    message_ids: list[str] = []
     for point in best_points:
         message_ids += extract_message_ids(point)
 
-    return SearchAPIResponse(
-        results=[SearchAPIItem(message_ids=message_ids)]
-    )
+    return SearchAPIResponse(results=[SearchAPIItem(message_ids=message_ids)])
 
 
 @app.exception_handler(Exception)
