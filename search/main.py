@@ -171,10 +171,10 @@ app = FastAPI(title="Search Service", version="0.1.0", lifespan=lifespan)
 # Внутри шаблона dense и rerank берутся из внешних HTTP endpoint'ов,
 # которые предоставляет проверяющая система.
 # Текущий код ниже — минимальный пример search pipeline.
-DENSE_PREFETCH_K = 10
-SPRASE_PREFETCH_K = 30
-RETRIEVE_K = 20
-RERANK_LIMIT = 10
+DENSE_PREFETCH_K = 100
+SPRASE_PREFETCH_K = 100
+RETRIEVE_K = 100
+RERANK_LIMIT = 50
 
 async def embed_dense(client: httpx.AsyncClient, text: str) -> list[float]:
     # Dense endpoint ожидает OpenAI-compatible body с input как списком строк.
@@ -311,8 +311,17 @@ async def search(payload: SearchAPIRequest) -> SearchAPIResponse:
     client: httpx.AsyncClient = app.state.http
     qdrant: AsyncQdrantClient = app.state.qdrant
 
-    dense_vector = await embed_dense(client, query)
-    sparse_vector = await embed_sparse(query)
+    dense_query = query + " " + "".join(payload.question.hyde) + " " + "".join(payload.question.variants)
+    sparse_query = (
+        query + " " + 
+        "".join(payload.question.keywords) + " " 
+        + "".join(payload.question.entities.people) + " " + 
+        "".join(payload.question.entities.emails) + " " +
+        "".join(payload.question.entities.documents) + " " + 
+        "".join(payload.question.variants)
+    )
+    dense_vector = await embed_dense(client, dense_query.strip())
+    sparse_vector = await embed_sparse(sparse_query.strip())
     best_points = await qdrant_search(qdrant, dense_vector, sparse_vector)
 
     if best_points is None:
