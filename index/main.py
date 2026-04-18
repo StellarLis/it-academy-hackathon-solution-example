@@ -5,6 +5,8 @@ from typing import Any
 import asyncio
 import hashlib
 
+import re
+
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
@@ -94,7 +96,21 @@ SPARSE_MODEL_NAME = "Qdrant/bm25"
 FASTEMBED_CACHE_PATH = "/models/fastembed"
 
 # Важная переманная, которая позволяет вычислять sparse вектор в несколько ядер. Не рекомендуется изменять.
-UVICORN_WORKERS=8
+UVICORN_WORKERS = 8
+
+
+def normalize_text(text):
+    if not text:
+        return ""
+
+    clean_text = re.sub(r"<[^>]+>", "", text)
+
+    clean_text = re.sub(r"[\n\r\t]+", " ", clean_text)
+
+    clean_text = re.sub(r"\s{2,}", " ", clean_text)
+
+    return clean_text.strip()
+
 
 def render_message(message: Message) -> str:
     text = ""
@@ -110,9 +126,9 @@ def render_message(message: Message) -> str:
             if isinstance(part_text, str) and part_text:
                 parts_text.append(part_text)
         if parts_text:
-            text += "\n".join(parts_text)
+            text += " ".join(parts_text)
 
-    return text
+    return normalize_text(text)
 
 
 def build_chunks(
@@ -121,7 +137,9 @@ def build_chunks(
 ) -> list[IndexAPIItem]:
     result: list[IndexAPIItem] = []
 
-    def build_text_and_ranges(messages: list[Message]) -> tuple[str, list[tuple[int, int, str]]]:
+    def build_text_and_ranges(
+        messages: list[Message],
+    ) -> tuple[str, list[tuple[int, int, str]]]:
         text_parts: list[str] = []
         message_ranges: list[tuple[int, int, str]] = []
         position = 0
@@ -189,6 +207,7 @@ def build_chunks(
 
     return result
 
+
 # Ваш сервис должен имплементировать оба этих метода
 @app.get("/health")
 async def health() -> dict[str, str]:
@@ -239,6 +258,7 @@ async def sparse_embedding(payload: SparseEmbeddingRequest) -> dict[str, Any]:
     # Проверяющая система вызывает этот endpoint при создании коллекции
     vectors = await asyncio.to_thread(embed_sparse_texts, payload.texts)
     return {"vectors": vectors}
+
 
 # красивая обработка ошибок
 @app.exception_handler(Exception)
