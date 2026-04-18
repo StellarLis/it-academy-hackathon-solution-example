@@ -4,6 +4,10 @@ from contextlib import asynccontextmanager
 from functools import lru_cache
 from typing import Any
 
+import regex
+import re
+import emoji
+
 import httpx
 from fastembed import SparseTextEmbedding
 from fastapi import FastAPI, HTTPException, Request
@@ -11,6 +15,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from qdrant_client import AsyncQdrantClient, models
+from datetime import datetime, timezone
 
 EMBEDDINGS_DENSE_MODEL = "Qwen/Qwen3-Embedding-0.6B"
 
@@ -37,6 +42,21 @@ REQUIRED_ENV_VARS = [
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 logger = logging.getLogger("search-service")
+
+
+def normalize_text(text):
+    if not text:
+        return ""
+
+    clean_text = re.sub(r"<[^>]+>", "", text)
+
+    clean_text = re.sub(r"[\n\r\t]+", " ", clean_text)
+
+    clean_text = emoji.replace_emoji(clean_text, replace=" ")
+
+    clean_text = re.sub(r"\s{2,}", " ", clean_text)
+
+    return clean_text.strip()
 
 
 def validate_required_env() -> None:
@@ -176,10 +196,10 @@ app = FastAPI(title="Search Service", version="0.1.0", lifespan=lifespan)
 # Внутри шаблона dense и rerank берутся из внешних HTTP endpoint'ов,
 # которые предоставляет проверяющая система.
 # Текущий код ниже — минимальный пример search pipeline.
-DENSE_PREFETCH_K = 10 # 10
-SPRASE_PREFETCH_K = 30 # 60
-RETRIEVE_K = 20 # 70
-RERANK_LIMIT = 10 # 50
+DENSE_PREFETCH_K = 50 # 10
+SPRASE_PREFETCH_K = 50 # 60
+RETRIEVE_K = 100 # 70
+RERANK_LIMIT = 50 # 50
 
 
 async def embed_dense(client: httpx.AsyncClient, text: str) -> list[float]:
@@ -213,10 +233,95 @@ async def embed_sparse(text: str) -> SparseVector:
     )
 
 
+def build_search_filter(
+    date_range,
+    chat_id,
+):
+
+    conditions = []
+
+    if date_range:
+        def _parse_datetime(value: Any) -> datetime | None:
+            if value is None:
+                return None
+            if isinstance(value, datetime):
+                return value
+            if isinstance(value, str):
+                s = value.strip()
+                if not s:
+                    return None
+                # Accept RFC3339/ISO-8601, including trailing "Z"
+                try:
+                    if s.endswith("Z"):
+                        return datetime.fromisoformat(s[:-1]).replace(tzinfo=timezone.utc)
+                    dt = datetime.fromisoformat(s)
+                    return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
+                except ValueError:
+                    return None
+            return None
+
+        def _coerce_number(value: Any) -> float | int | None:
+            if value is None:
+                return None
+            if isinstance(value, (int, float)):
+                return value
+            if isinstance(value, str):
+                s = value.strip()
+                if not s:
+                    return None
+                try:
+                    return int(s) if s.isdigit() else float(s)
+                except ValueError:
+                    return None
+            return None
+
+        raw_gte = getattr(date_range, "from_", None)
+        raw_lte = getattr(date_range, "to", None)
+
+        gte_dt = _parse_datetime(raw_gte)
+        lte_dt = _parse_datetime(raw_lte)
+        if gte_dt is not None or lte_dt is not None:
+            conditions.append(
+                models.FieldCondition(
+                    key="metadata.start",
+                    range=models.DatetimeRange(
+                        gte=gte_dt,
+                        lte=lte_dt,
+                    ),
+                )
+            )
+        else:
+            gte_num = _coerce_number(raw_gte)
+            lte_num = _coerce_number(raw_lte)
+            if gte_num is not None or lte_num is not None:
+                conditions.append(
+                    models.FieldCondition(
+                        key="metadata.start",
+                        range=models.Range(
+                            gte=gte_num,
+                            lte=lte_num,
+                        ),
+                    )
+                )
+
+    if chat_id:
+        conditions.append(
+            models.FieldCondition(
+                key="metadata.chat_id",
+                match=models.MatchValue(value=chat_id),
+            )
+        )
+
+    if not conditions:
+        return None
+
+    return models.Filter(must=conditions)
+
 async def qdrant_search(
     client: AsyncQdrantClient,
     dense_vector: list[float],
-    sparse_vector: SparseVector,
+    sparse_vector: SparseVector
+    , search_filter: Any | None = None
 ) -> Any | None:
     response = await client.query_points(
         collection_name=QDRANT_COLLECTION_NAME,
@@ -238,6 +343,7 @@ async def qdrant_search(
         query=models.FusionQuery(fusion=models.Fusion.RRF),
         limit=RETRIEVE_K,
         with_payload=True,
+        query_filter=search_filter,
     )
 
     if not response.points:
@@ -281,6 +387,25 @@ async def get_rerank_scores(
     return [float(sample["score"]) for sample in data]
 
 
+def deduplicate_by_message(points: list[Any]) -> list[Any]:
+    seen_message_ids = set()
+    unique_points = []
+    
+    for point in points:
+        msg_ids = extract_message_ids(point)
+
+        if not msg_ids:
+            continue
+            
+        primary_msg_id = msg_ids[0]
+        
+        if primary_msg_id not in seen_message_ids:
+            seen_message_ids.add(primary_msg_id)
+            unique_points.append(point)
+            
+    return unique_points
+
+
 async def rerank_points(
     client: httpx.AsyncClient,
     query: str,
@@ -317,23 +442,25 @@ async def search(payload: SearchAPIRequest) -> SearchAPIResponse:
     client: httpx.AsyncClient = app.state.http
     qdrant: AsyncQdrantClient = app.state.qdrant
 
-    dense_query = query + " " + "".join(payload.question.hyde) + " " + "".join(payload.question.variants)
+    dense_query = query + " " + "".join(payload.question.hyde)
     sparse_query = (
         query + " " + 
         "".join(payload.question.keywords) + " " 
         + "".join(payload.question.entities.people) + " " + 
         "".join(payload.question.entities.emails) + " " +
-        "".join(payload.question.entities.documents) + " " + 
-        "".join(payload.question.variants)
+        "".join(payload.question.entities.documents) + " " #######+ 
+        ######"".join(payload.question.variants)
     )
-    dense_vector = await embed_dense(client, dense_query.strip())
-    sparse_vector = await embed_sparse(sparse_query.strip())
-    best_points = await qdrant_search(qdrant, dense_vector, sparse_vector)
+    search_filter = build_search_filter(payload.question.date_range, None)
+    dense_vector = await embed_dense(client, normalize_text(dense_query))
+    sparse_vector = await embed_sparse(normalize_text(sparse_query))
+    best_points = await qdrant_search(qdrant, dense_vector, sparse_vector, search_filter)
 
     if best_points is None:
         return SearchAPIResponse(results=[])
 
     best_points = await rerank_points(client, query, list(best_points))
+    best_points = deduplicate_by_message(best_points)
 
     message_ids: list[str] = []
     for point in best_points:

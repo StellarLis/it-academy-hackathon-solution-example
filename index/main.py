@@ -5,7 +5,9 @@ from typing import Any
 import asyncio
 import hashlib
 
+import regex
 import re
+import emoji
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
@@ -90,8 +92,8 @@ app = FastAPI(title="Index Service", version="0.1.0")
 # Ваша внутренняя логика построения чанков. Можете делать всё, что посчитаете нужным.
 # Текущий код – минимальный пример
 
-CHUNK_SIZE = 512
-OVERLAP_SIZE = 256
+CHUNK_SIZE = 300 #512
+OVERLAP_SIZE = 150 #256
 SPARSE_MODEL_NAME = "Qdrant/bm25"
 FASTEMBED_CACHE_PATH = "/models/fastembed"
 
@@ -106,6 +108,8 @@ def normalize_text(text):
     clean_text = re.sub(r"<[^>]+>", "", text)
 
     clean_text = re.sub(r"[\n\r\t]+", " ", clean_text)
+
+    clean_text = emoji.replace_emoji(clean_text, replace=" ")
 
     clean_text = re.sub(r"\s{2,}", " ", clean_text)
 
