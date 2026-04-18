@@ -196,10 +196,10 @@ app = FastAPI(title="Search Service", version="0.1.0", lifespan=lifespan)
 # Внутри шаблона dense и rerank берутся из внешних HTTP endpoint'ов,
 # которые предоставляет проверяющая система.
 # Текущий код ниже — минимальный пример search pipeline.
-DENSE_PREFETCH_K = 50 # 10
-SPRASE_PREFETCH_K = 50 # 60
-RETRIEVE_K = 100 # 70
-RERANK_LIMIT = 50 # 50
+DENSE_PREFETCH_K = 50  # 10
+SPRASE_PREFETCH_K = 50  # 60
+RETRIEVE_K = 100  # 70
+RERANK_LIMIT = 50  # 50
 
 
 async def embed_dense(client: httpx.AsyncClient, text: str) -> list[float]:
@@ -233,14 +233,12 @@ async def embed_sparse(text: str) -> SparseVector:
     )
 
 
-def build_search_filter(
-    date_range,
-    chat_id,
-):
+def build_search_filter(date_range, chat_id, participants, entities):
 
     conditions = []
 
     if date_range:
+
         def _parse_datetime(value: Any) -> datetime | None:
             if value is None:
                 return None
@@ -253,9 +251,13 @@ def build_search_filter(
                 # Accept RFC3339/ISO-8601, including trailing "Z"
                 try:
                     if s.endswith("Z"):
-                        return datetime.fromisoformat(s[:-1]).replace(tzinfo=timezone.utc)
+                        return datetime.fromisoformat(s[:-1]).replace(
+                            tzinfo=timezone.utc
+                        )
                     dt = datetime.fromisoformat(s)
-                    return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
+                    return (
+                        dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
+                    )
                 except ValueError:
                     return None
             return None
@@ -304,24 +306,41 @@ def build_search_filter(
                     )
                 )
 
-    if chat_id:
-        conditions.append(
-            models.FieldCondition(
-                key="metadata.chat_id",
-                match=models.MatchValue(value=chat_id),
+    # if chat_id:
+    #     conditions.append(
+    #         models.FieldCondition(
+    #             key="metadata.chat_id",
+    #             match=models.MatchValue(value=chat_id),
+    #         )
+    #     )
+
+    if participants:
+        for p in participants:
+            conditions.append(
+                models.FieldCondition(
+                    key="participants", match=models.MatchValue(value=p)
+                )
             )
-        )
+
+    if entities and entities.names:
+        for name in question.entities.names:
+            conditions.append(
+                models.FieldCondition(
+                    key="chat_name", match=models.MatchValue(value=name)
+                )
+            )
 
     if not conditions:
         return None
 
     return models.Filter(must=conditions)
 
+
 async def qdrant_search(
     client: AsyncQdrantClient,
     dense_vector: list[float],
-    sparse_vector: SparseVector
-    , search_filter: Any | None = None
+    sparse_vector: SparseVector,
+    search_filter: Any | None = None,
 ) -> Any | None:
     response = await client.query_points(
         collection_name=QDRANT_COLLECTION_NAME,
@@ -390,19 +409,19 @@ async def get_rerank_scores(
 def deduplicate_by_message(points: list[Any]) -> list[Any]:
     seen_message_ids = set()
     unique_points = []
-    
+
     for point in points:
         msg_ids = extract_message_ids(point)
 
         if not msg_ids:
             continue
-            
+
         primary_msg_id = msg_ids[0]
-        
+
         if primary_msg_id not in seen_message_ids:
             seen_message_ids.add(primary_msg_id)
             unique_points.append(point)
-            
+
     return unique_points
 
 
@@ -444,17 +463,31 @@ async def search(payload: SearchAPIRequest) -> SearchAPIResponse:
 
     dense_query = query + " " + "".join(payload.question.hyde)
     sparse_query = (
-        query + " " + 
-        "".join(payload.question.keywords) + " " 
-        + "".join(payload.question.entities.people) + " " + 
-        "".join(payload.question.entities.emails) + " " +
-        "".join(payload.question.entities.documents) + " " #######+ 
+        query
+        + " "
+        + "".join(payload.question.keywords)
+        + " "
+        + "".join(payload.question.entities.people)
+        + " "
+        + "".join(payload.question.entities.emails)
+        + " "
+        + "".join(payload.question.entities.documents)
+        + " "  #######+
         ######"".join(payload.question.variants)
     )
-    search_filter = build_search_filter(payload.question.date_range, None)
+
+    participants = None
+    if payload.question.entities.people:
+        participants = payload.question.entities.people
+
+    search_filter = build_search_filter(
+        payload.question.date_range, None, participants, payload.question.entities
+    )
     dense_vector = await embed_dense(client, normalize_text(dense_query))
     sparse_vector = await embed_sparse(normalize_text(sparse_query))
-    best_points = await qdrant_search(qdrant, dense_vector, sparse_vector, search_filter)
+    best_points = await qdrant_search(
+        qdrant, dense_vector, sparse_vector, search_filter
+    )
 
     if best_points is None:
         return SearchAPIResponse(results=[])
