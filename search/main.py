@@ -171,10 +171,10 @@ app = FastAPI(title="Search Service", version="0.1.0", lifespan=lifespan)
 # Внутри шаблона dense и rerank берутся из внешних HTTP endpoint'ов,
 # которые предоставляет проверяющая система.
 # Текущий код ниже — минимальный пример search pipeline.
-DENSE_PREFETCH_K = 100
-SPRASE_PREFETCH_K = 100
-RETRIEVE_K = 100
-RERANK_LIMIT = 50
+DENSE_PREFETCH_K = 10 # 10
+SPRASE_PREFETCH_K = 30 # 60
+RETRIEVE_K = 20 # 70
+RERANK_LIMIT = 10 # 50
 
 async def embed_dense(client: httpx.AsyncClient, text: str) -> list[float]:
     # Dense endpoint ожидает OpenAI-compatible body с input как списком строк.
