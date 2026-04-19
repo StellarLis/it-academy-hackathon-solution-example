@@ -117,6 +117,8 @@ def normalize_text(text):
 
 
 def render_message(message: Message) -> str:
+    header = f"[Sender: {message.sender_id}]"
+
     text = ""
 
     if message.text:
@@ -132,7 +134,7 @@ def render_message(message: Message) -> str:
         if parts_text:
             text += " ".join(parts_text)
 
-    return normalize_text(text)
+    return header + normalize_text(text)
 
 
 def build_chunks(
