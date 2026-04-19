@@ -56,6 +56,12 @@ def load_rerank_model():
     rerank_model.model.eval()
 
 
+def concat_parts(parts: list[str] | None) -> str:
+    if not parts:
+        return ""
+    return " ".join(item for item in parts if isinstance(item, str) and item)
+
+
 def normalize_text(text):
     if not text:
         return ""
@@ -298,7 +304,7 @@ def build_search_filter(date_range, participants):
         gte_dt = _parse_datetime(raw_gte)
         lte_dt = _parse_datetime(raw_lte)
         if gte_dt is not None or lte_dt is not None:
-            conditions.append(
+            conditions_must.append(
                 models.FieldCondition(
                     key="metadata.start",
                     range=models.DatetimeRange(
@@ -325,7 +331,7 @@ def build_search_filter(date_range, participants):
         for p in participants:
             conditions_should.append(
                 models.FieldCondition(
-                    key="participants", match=models.MatchValue(value=p)
+                    key="metadata.participants", match=models.MatchValue(value=p)
                 )
             )
 
@@ -464,27 +470,44 @@ async def search(payload: SearchAPIRequest) -> SearchAPIResponse:
     if not query:
         raise HTTPException(status_code=400, detail="question.text is required")
 
+    if rerank_model is None:
+        logger.error("Rerank model is not initialized")
+        raise HTTPException(status_code=503, detail="rerank model is not initialized")
+
     client: httpx.AsyncClient = app.state.http
     qdrant: AsyncQdrantClient = app.state.qdrant
 
-    dense_query = query + " " + "".join(payload.question.hyde)
+    hyde_text = concat_parts(payload.question.hyde)
+    keywords_text = concat_parts(payload.question.keywords)
+    variants_text = concat_parts(payload.question.variants)
+
+    people: list[str] = []
+    emails: list[str] = []
+    documents: list[str] = []
+    if payload.question.entities is not None:
+        people = payload.question.entities.people or []
+        emails = payload.question.entities.emails or []
+        documents = payload.question.entities.documents or []
+
+    dense_query = " ".join(part for part in [query, hyde_text] if part)
     sparse_query = (
-        query
-        + " "
-        + "".join(payload.question.keywords)
-        + " "
-        + "".join(payload.question.entities.people)
-        + " "
-        + "".join(payload.question.entities.emails)
-        + " "
-        + "".join(payload.question.entities.documents)
-        + " "  #######+
-        ######"".join(payload.question.variants)
+        " ".join(
+            part
+            for part in [
+                query,
+                keywords_text,
+                concat_parts(people),
+                concat_parts(emails),
+                concat_parts(documents),
+                variants_text,
+            ]
+            if part
+        )
     )
 
     participants = None
-    if payload.question.entities.people:
-        participants = payload.question.entities.people
+    if people:
+        participants = people
 
     search_filter = build_search_filter(payload.question.date_range, participants)
     dense_vector = await embed_dense(client, normalize_text(dense_query))
