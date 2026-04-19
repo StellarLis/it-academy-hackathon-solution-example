@@ -199,7 +199,7 @@ app = FastAPI(title="Search Service", version="0.1.0", lifespan=lifespan)
 DENSE_PREFETCH_K = 50  # 10
 SPRASE_PREFETCH_K = 50  # 60
 RETRIEVE_K = 100  # 70
-RERANK_LIMIT = 50  # 50
+RERANK_LIMIT = 25  # 50
 
 
 async def embed_dense(client: httpx.AsyncClient, text: str) -> list[float]:
@@ -283,26 +283,36 @@ def build_search_filter(date_range, chat_id, participants, entities):
         gte_dt = _parse_datetime(raw_gte)
         lte_dt = _parse_datetime(raw_lte)
         if gte_dt is not None or lte_dt is not None:
-            conditions.append(
-                models.FieldCondition(
-                    key="metadata.start",
-                    range=models.DatetimeRange(
-                        gte=gte_dt,
-                        lte=lte_dt,
-                    ),
+            # Chunk overlaps [gte, lte] iff start <= lte AND end >= gte (half-open OK for points).
+            if gte_dt is not None:
+                conditions.append(
+                    models.FieldCondition(
+                        key="metadata.end",
+                        range=models.DatetimeRange(gte=gte_dt),
+                    )
                 )
-            )
-        else:
-            gte_num = _coerce_number(raw_gte)
-            lte_num = _coerce_number(raw_lte)
-            if gte_num is not None or lte_num is not None:
+            if lte_dt is not None:
                 conditions.append(
                     models.FieldCondition(
                         key="metadata.start",
-                        range=models.Range(
-                            gte=gte_num,
-                            lte=lte_num,
-                        ),
+                        range=models.DatetimeRange(lte=lte_dt),
+                    )
+                )
+        else:
+            gte_num = _coerce_number(raw_gte)
+            lte_num = _coerce_number(raw_lte)
+            if gte_num is not None:
+                conditions.append(
+                    models.FieldCondition(
+                        key="metadata.end",
+                        range=models.Range(gte=gte_num),
+                    )
+                )
+            if lte_num is not None:
+                conditions.append(
+                    models.FieldCondition(
+                        key="metadata.start",
+                        range=models.Range(lte=lte_num),
                     )
                 )
 
@@ -314,21 +324,25 @@ def build_search_filter(date_range, chat_id, participants, entities):
     #         )
     #     )
 
-    if participants:
-        for p in participants:
-            conditions.append(
-                models.FieldCondition(
-                    key="participants", match=models.MatchValue(value=p)
-                )
-            )
+    # if participants:
+    #    ids = [str(p) for p in participants if p is not None and str(p).strip()]
+    #    if ids:
+    #        conditions.append(
+    #            models.FieldCondition(
+    #                key="metadata.participants",
+    #                match=models.MatchAny(any=ids),
+    #            )
+    #        )
 
-    if entities and entities.names:
-        for name in question.entities.names:
-            conditions.append(
-                models.FieldCondition(
-                    key="chat_name", match=models.MatchValue(value=name)
-                )
-            )
+    # if entities and entities.names:
+    #    names = [str(n) for n in entities.names if n is not None and str(n).strip()]
+    #    if names:
+    #        conditions.append(
+    #            models.FieldCondition(
+    #                key="metadata.chat_name",
+    #                match=models.MatchAny(any=names),
+    #            )
+    #        )
 
     if not conditions:
         return None
@@ -407,22 +421,21 @@ async def get_rerank_scores(
 
 
 def deduplicate_by_message(points: list[Any]) -> list[Any]:
-    seen_message_ids = set()
-    unique_points = []
+    best_per_message = {}
 
     for point in points:
         msg_ids = extract_message_ids(point)
-
         if not msg_ids:
             continue
 
+        # Берем первое message_id как основное (или агрегируем)
         primary_msg_id = msg_ids[0]
 
-        if primary_msg_id not in seen_message_ids:
-            seen_message_ids.add(primary_msg_id)
-            unique_points.append(point)
+        if primary_msg_id not in best_per_message:
+            best_per_message[primary_msg_id] = point
+        # Иначе пропускаем дубликат
 
-    return unique_points
+    return list(best_per_message.values())
 
 
 async def rerank_points(
@@ -430,7 +443,7 @@ async def rerank_points(
     query: str,
     points: list[Any],
 ) -> list[Any]:
-    rerank_candidates = points[:10]
+    rerank_candidates = points[:RERANK_LIMIT]
     rerank_targets = [point.payload.get("page_content") for point in rerank_candidates]
     scores = await get_rerank_scores(client, query, rerank_targets)
 
@@ -461,17 +474,17 @@ async def search(payload: SearchAPIRequest) -> SearchAPIResponse:
     client: httpx.AsyncClient = app.state.http
     qdrant: AsyncQdrantClient = app.state.qdrant
 
-    dense_query = query + " " + "".join(payload.question.hyde)
+    dense_query = query + " " + " ".join(payload.question.hyde)
     sparse_query = (
         query
         + " "
-        + "".join(payload.question.keywords)
+        + " ".join(payload.question.keywords)
         + " "
-        + "".join(payload.question.entities.people)
+        + " ".join(payload.question.entities.people)
         + " "
-        + "".join(payload.question.entities.emails)
+        + " ".join(payload.question.entities.emails)
         + " "
-        + "".join(payload.question.entities.documents)
+        + " ".join(payload.question.entities.documents)
         + " "  #######+
         ######"".join(payload.question.variants)
     )
