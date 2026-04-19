@@ -7,6 +7,7 @@ from typing import Any
 import regex
 import re
 import emoji
+import torch
 
 import httpx
 from fastembed import SparseTextEmbedding
@@ -17,7 +18,10 @@ from pydantic import BaseModel, Field
 from qdrant_client import AsyncQdrantClient, models
 from datetime import datetime, timezone
 
+from sentence_transformers import CrossEncoder
+
 EMBEDDINGS_DENSE_MODEL = "Qwen/Qwen3-Embedding-0.6B"
+MODEL_PATH = "/app/models/cross-encoder-ms-marco-MiniLM-L-6-v2"
 
 # Ваш сервис должен считывать эти переменные из окружения (env), так как проверяющая система управляет ими
 HOST = os.getenv("HOST", "0.0.0.0")
@@ -42,6 +46,14 @@ REQUIRED_ENV_VARS = [
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 logger = logging.getLogger("search-service")
+
+rerank_model = None
+
+
+def load_rerank_model():
+    global rerank_model
+    rerank_model = CrossEncoder(MODEL_PATH, device="cpu")
+    rerank_model.model.eval()
 
 
 def normalize_text(text):
@@ -178,6 +190,8 @@ def get_sparse_model() -> SparseTextEmbedding:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+
+    load_rerank_model()
     app.state.http = httpx.AsyncClient()
     app.state.qdrant = AsyncQdrantClient(
         url=QDRANT_URL,
@@ -233,9 +247,10 @@ async def embed_sparse(text: str) -> SparseVector:
     )
 
 
-def build_search_filter(date_range, chat_id, participants, entities):
+def build_search_filter(date_range, participants):
 
-    conditions = []
+    conditions_must = []
+    conditions_should = []
 
     if date_range:
 
@@ -316,6 +331,13 @@ def build_search_filter(date_range, chat_id, participants, entities):
                     )
                 )
 
+    if participants:
+        for p in participants:
+            conditions_should.append(
+                models.FieldCondition(
+                    key="participants", match=models.MatchValue(value=p)
+                )
+            )
     # if chat_id:
     #     conditions.append(
     #         models.FieldCondition(
@@ -334,6 +356,7 @@ def build_search_filter(date_range, chat_id, participants, entities):
     #            )
     #        )
 
+    if not conditions_must and not conditions_should:
     # if entities and entities.names:
     #    names = [str(n) for n in entities.names if n is not None and str(n).strip()]
     #    if names:
@@ -347,7 +370,14 @@ def build_search_filter(date_range, chat_id, participants, entities):
     if not conditions:
         return None
 
-    return models.Filter(must=conditions)
+    if conditions_must and conditions_should:
+        return models.Filter(
+            must=conditions_must, should=conditions_should, min_should=1
+        )
+    elif conditions_should:
+        return models.Filter(should=conditions_should, min_should=1)
+
+    return models.Filter(must=conditions_must)
 
 
 async def qdrant_search(
@@ -493,11 +523,10 @@ async def search(payload: SearchAPIRequest) -> SearchAPIResponse:
     if payload.question.entities.people:
         participants = payload.question.entities.people
 
-    search_filter = build_search_filter(
-        payload.question.date_range, None, participants, payload.question.entities
-    )
+    search_filter = build_search_filter(payload.question.date_range, participants)
     dense_vector = await embed_dense(client, normalize_text(dense_query))
     sparse_vector = await embed_sparse(normalize_text(sparse_query))
+
     best_points = await qdrant_search(
         qdrant, dense_vector, sparse_vector, search_filter
     )
@@ -505,12 +534,33 @@ async def search(payload: SearchAPIRequest) -> SearchAPIResponse:
     if best_points is None:
         return SearchAPIResponse(results=[])
 
-    best_points = await rerank_points(client, query, list(best_points))
-    best_points = deduplicate_by_message(best_points)
+    candidates = best_points[:RERANK_LIMIT]
+
+    pairs = []
+    valid_points = []
+    for point in candidates:
+        text = point.payload.get("page_content", "")
+        if text:
+            pairs.append([query, text])
+            valid_points.append(point)
+
+    if not pairs:
+        return SearchAPIResponse(results=[])
+
+    with torch.no_grad():
+        scores = rerank_model.predict(pairs, batch_size=32, show_progress_bar=False)
+
+    scored_candidates = list(zip(scores.tolist(), valid_points))
+
+    scored_candidates.sort(key=lambda x: x[0], reverse=True)
+
+    sorted_points = [point for _, point in scored_candidates]
+    unique_points = deduplicate_by_message(sorted_points)
 
     message_ids: list[str] = []
-    for point in best_points:
-        message_ids += extract_message_ids(point)
+    for point in unique_points:
+        ids = extract_message_ids(point)
+        message_ids.extend(ids)
 
     return SearchAPIResponse(results=[SearchAPIItem(message_ids=message_ids)])
 
