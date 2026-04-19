@@ -7,7 +7,6 @@ from typing import Any
 import regex
 import re
 import emoji
-import torch
 
 import httpx
 from fastembed import SparseTextEmbedding
@@ -18,10 +17,7 @@ from pydantic import BaseModel, Field
 from qdrant_client import AsyncQdrantClient, models
 from datetime import datetime, timezone
 
-from sentence_transformers import CrossEncoder
-
 EMBEDDINGS_DENSE_MODEL = "Qwen/Qwen3-Embedding-0.6B"
-MODEL_PATH = "/app/models/cross-encoder-ms-marco-MiniLM-L-6-v2"
 
 # Ваш сервис должен считывать эти переменные из окружения (env), так как проверяющая система управляет ими
 HOST = os.getenv("HOST", "0.0.0.0")
@@ -46,20 +42,6 @@ REQUIRED_ENV_VARS = [
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 logger = logging.getLogger("search-service")
-
-rerank_model = None
-
-
-def load_rerank_model():
-    global rerank_model
-    rerank_model = CrossEncoder(MODEL_PATH, device="cpu")
-    rerank_model.model.eval()
-
-
-def concat_parts(parts: list[str] | None) -> str:
-    if not parts:
-        return ""
-    return " ".join(item for item in parts if isinstance(item, str) and item)
 
 
 def normalize_text(text):
@@ -196,8 +178,6 @@ def get_sparse_model() -> SparseTextEmbedding:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-
-    load_rerank_model()
     app.state.http = httpx.AsyncClient()
     app.state.qdrant = AsyncQdrantClient(
         url=QDRANT_URL,
@@ -219,7 +199,7 @@ app = FastAPI(title="Search Service", version="0.1.0", lifespan=lifespan)
 DENSE_PREFETCH_K = 50  # 10
 SPRASE_PREFETCH_K = 50  # 60
 RETRIEVE_K = 100  # 70
-RERANK_LIMIT = 25  # 50
+RERANK_LIMIT = 30  # 50
 
 
 async def embed_dense(client: httpx.AsyncClient, text: str) -> list[float]:
@@ -304,36 +284,26 @@ def build_search_filter(date_range, participants):
         gte_dt = _parse_datetime(raw_gte)
         lte_dt = _parse_datetime(raw_lte)
         if gte_dt is not None or lte_dt is not None:
-            # Chunk overlaps [gte, lte] iff start <= lte AND end >= gte (half-open OK for points).
-            if gte_dt is not None:
-                conditions.append(
-                    models.FieldCondition(
-                        key="metadata.end",
-                        range=models.DatetimeRange(gte=gte_dt),
-                    )
+            conditions_must.append(
+                models.FieldCondition(
+                    key="metadata.start",
+                    range=models.DatetimeRange(
+                        gte=gte_dt,
+                        lte=lte_dt,
+                    ),
                 )
-            if lte_dt is not None:
-                conditions.append(
-                    models.FieldCondition(
-                        key="metadata.start",
-                        range=models.DatetimeRange(lte=lte_dt),
-                    )
-                )
+            )
         else:
             gte_num = _coerce_number(raw_gte)
             lte_num = _coerce_number(raw_lte)
-            if gte_num is not None:
-                conditions.append(
-                    models.FieldCondition(
-                        key="metadata.end",
-                        range=models.Range(gte=gte_num),
-                    )
-                )
-            if lte_num is not None:
-                conditions.append(
+            if gte_num is not None or lte_num is not None:
+                conditions_must.append(
                     models.FieldCondition(
                         key="metadata.start",
-                        range=models.Range(lte=lte_num),
+                        range=models.Range(
+                            gte=gte_num,
+                            lte=lte_num,
+                        ),
                     )
                 )
 
@@ -344,36 +314,8 @@ def build_search_filter(date_range, participants):
                     key="metadata.participants", match=models.MatchValue(value=p)
                 )
             )
-    # if chat_id:
-    #     conditions.append(
-    #         models.FieldCondition(
-    #             key="metadata.chat_id",
-    #             match=models.MatchValue(value=chat_id),
-    #         )
-    #     )
-
-    # if participants:
-    #    ids = [str(p) for p in participants if p is not None and str(p).strip()]
-    #    if ids:
-    #        conditions.append(
-    #            models.FieldCondition(
-    #                key="metadata.participants",
-    #                match=models.MatchAny(any=ids),
-    #            )
-    #        )
 
     if not conditions_must and not conditions_should:
-    # if entities and entities.names:
-    #    names = [str(n) for n in entities.names if n is not None and str(n).strip()]
-    #    if names:
-    #        conditions.append(
-    #            models.FieldCondition(
-    #                key="metadata.chat_name",
-    #                match=models.MatchAny(any=names),
-    #            )
-    #        )
-
-    if not conditions:
         return None
 
     if conditions_must and conditions_should:
@@ -507,10 +449,6 @@ async def search(payload: SearchAPIRequest) -> SearchAPIResponse:
     if not query:
         raise HTTPException(status_code=400, detail="question.text is required")
 
-    if rerank_model is None:
-        logger.error("Rerank model is not initialized")
-        raise HTTPException(status_code=503, detail="rerank model is not initialized")
-
     client: httpx.AsyncClient = app.state.http
     qdrant: AsyncQdrantClient = app.state.qdrant
 
@@ -530,13 +468,14 @@ async def search(payload: SearchAPIRequest) -> SearchAPIResponse:
     )
 
     participants = None
-    if people:
-        participants = people
+    if payload.question.entities.people:
+        participants = payload.question.entities.people
 
-    search_filter = build_search_filter(payload.question.date_range, participants)
+    search_filter = build_search_filter(
+        payload.question.date_range, participants
+    )
     dense_vector = await embed_dense(client, normalize_text(dense_query))
     sparse_vector = await embed_sparse(normalize_text(sparse_query))
-
     best_points = await qdrant_search(
         qdrant, dense_vector, sparse_vector, search_filter
     )
@@ -544,33 +483,12 @@ async def search(payload: SearchAPIRequest) -> SearchAPIResponse:
     if best_points is None:
         return SearchAPIResponse(results=[])
 
-    candidates = best_points[:RERANK_LIMIT]
-
-    pairs = []
-    valid_points = []
-    for point in candidates:
-        text = point.payload.get("page_content", "")
-        if text:
-            pairs.append([query, text])
-            valid_points.append(point)
-
-    if not pairs:
-        return SearchAPIResponse(results=[])
-
-    with torch.no_grad():
-        scores = rerank_model.predict(pairs, batch_size=32, show_progress_bar=False)
-
-    scored_candidates = list(zip(scores.tolist(), valid_points))
-
-    scored_candidates.sort(key=lambda x: x[0], reverse=True)
-
-    sorted_points = [point for _, point in scored_candidates]
-    unique_points = deduplicate_by_message(sorted_points)
+    best_points = await rerank_points(client, query, list(best_points))
+    best_points = deduplicate_by_message(best_points)
 
     message_ids: list[str] = []
-    for point in unique_points:
-        ids = extract_message_ids(point)
-        message_ids.extend(ids)
+    for point in best_points:
+        message_ids += extract_message_ids(point)
 
     return SearchAPIResponse(results=[SearchAPIItem(message_ids=message_ids)])
 
