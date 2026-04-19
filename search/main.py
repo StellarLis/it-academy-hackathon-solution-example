@@ -56,6 +56,12 @@ def load_rerank_model():
     rerank_model.model.eval()
 
 
+def concat_parts(parts: list[str] | None) -> str:
+    if not parts:
+        return ""
+    return " ".join(item for item in parts if isinstance(item, str) and item)
+
+
 def normalize_text(text):
     if not text:
         return ""
@@ -335,7 +341,7 @@ def build_search_filter(date_range, participants):
         for p in participants:
             conditions_should.append(
                 models.FieldCondition(
-                    key="participants", match=models.MatchValue(value=p)
+                    key="metadata.participants", match=models.MatchValue(value=p)
                 )
             )
     # if chat_id:
@@ -501,6 +507,10 @@ async def search(payload: SearchAPIRequest) -> SearchAPIResponse:
     if not query:
         raise HTTPException(status_code=400, detail="question.text is required")
 
+    if rerank_model is None:
+        logger.error("Rerank model is not initialized")
+        raise HTTPException(status_code=503, detail="rerank model is not initialized")
+
     client: httpx.AsyncClient = app.state.http
     qdrant: AsyncQdrantClient = app.state.qdrant
 
@@ -520,8 +530,8 @@ async def search(payload: SearchAPIRequest) -> SearchAPIResponse:
     )
 
     participants = None
-    if payload.question.entities.people:
-        participants = payload.question.entities.people
+    if people:
+        participants = people
 
     search_filter = build_search_filter(payload.question.date_range, participants)
     dense_vector = await embed_dense(client, normalize_text(dense_query))
