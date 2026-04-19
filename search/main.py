@@ -247,7 +247,7 @@ async def embed_sparse(text: str) -> SparseVector:
     )
 
 
-def build_search_filter(date_range, chat_id, participants, entities):
+def build_search_filter(date_range, participants):
 
     conditions_must = []
     conditions_should = []
@@ -311,7 +311,7 @@ def build_search_filter(date_range, chat_id, participants, entities):
             gte_num = _coerce_number(raw_gte)
             lte_num = _coerce_number(raw_lte)
             if gte_num is not None or lte_num is not None:
-                conditions.append(
+                conditions_must.append(
                     models.FieldCondition(
                         key="metadata.start",
                         range=models.Range(
@@ -321,34 +321,25 @@ def build_search_filter(date_range, chat_id, participants, entities):
                     )
                 )
 
-    # if chat_id:
-    #     conditions.append(
-    #         models.FieldCondition(
-    #             key="metadata.chat_id",
-    #             match=models.MatchValue(value=chat_id),
-    #         )
-    #     )
-
     if participants:
         for p in participants:
-            conditions.append(
+            conditions_should.append(
                 models.FieldCondition(
                     key="participants", match=models.MatchValue(value=p)
                 )
             )
 
-    if entities and entities.names:
-        for name in question.entities.names:
-            conditions.append(
-                models.FieldCondition(
-                    key="chat_name", match=models.MatchValue(value=name)
-                )
-            )
-
-    if not conditions:
+    if not conditions_must and not conditions_should:
         return None
 
-    return models.Filter(must=conditions)
+    if conditions_must and conditions_should:
+        return models.Filter(
+            must=conditions_must, should=conditions_should, min_should=1
+        )
+    elif conditions_should:
+        return models.Filter(should=conditions_should, min_should=1)
+
+    return models.Filter(must=conditions_must)
 
 
 async def qdrant_search(
@@ -495,9 +486,7 @@ async def search(payload: SearchAPIRequest) -> SearchAPIResponse:
     if payload.question.entities.people:
         participants = payload.question.entities.people
 
-    search_filter = build_search_filter(
-        payload.question.date_range, None, participants, payload.question.entities
-    )
+    search_filter = build_search_filter(payload.question.date_range, participants)
     dense_vector = await embed_dense(client, normalize_text(dense_query))
     sparse_vector = await embed_sparse(normalize_text(sparse_query))
 
